@@ -615,17 +615,109 @@ def process(df, sku_col, img_col, base_url, exts, verify, overwrite, check_exist
     })
     return values, report
 
+import re
 
+def parse_main_index(main_raw: str, n: int):
+    """Extract the image-slot number from a mainImage value like '791664_7',
+    '791664_7.jpg', or '7'. Returns None if it can't be parsed or is out of range."""
+    main_raw = str(main_raw or "").strip()
+    if not main_raw:
+        return None
+
+    # Strip query parameters or file extensions if present
+    main_raw = main_raw.split("?")[0]
+    main_raw = re.sub(r"\.(jpg|jpeg|png|webp)$", "", main_raw, flags=re.IGNORECASE)
+
+    # Match trailing index after an underscore (e.g., '791664_7' -> 7)
+    m = re.search(r"_(\d+)$", main_raw)
+    if m:
+        idx = int(m.group(1))
+    else:
+        # Fallback to standalone digit
+        try:
+            idx = int(float(main_raw))
+        except ValueError:
+            idx = None
+
+    if idx is not None and 1 <= idx <= n:
+        return idx
+    return None
+
+
+def reorder_main_first(pairs, main_idx):
+    """pairs: list of (slot_index, url). Puts the pair whose slot_index ==
+    main_idx first, keeping the remaining items in their original order."""
+    if main_idx is None:
+        return [u for _, u in pairs]
+    main = [u for i, u in pairs if i == main_idx]
+    rest = [u for i, u in pairs if i != main_idx]
+    return main + rest
 # --------------------------------------------------------------------------- #
 # Core logic — multiple images per product (count column)
 # --------------------------------------------------------------------------- #
-def resolve_row_multi(sku, count_raw, base_url, ext, verify):
-    """Build <sku>_1.<ext> .. <sku>_N.<ext> for a product with N images.
+# def resolve_row_multi(sku, count_raw, base_url, ext, verify):
+#     """Build <sku>_1.<ext> .. <sku>_N.<ext> for a product with N images.
 
-    Returns (list_of_urls, status). With verify on, only URLs that
-    return HTTP 200 are kept (in order); the status reports how many
-    of the N were found.
-    """
+#     Returns (list_of_urls, status). With verify on, only URLs that
+#     return HTTP 200 are kept (in order); the status reports how many
+#     of the N were found.
+#     """
+#     sku = (sku or "").strip()
+#     count_raw = (count_raw or "").strip()
+
+#     if not sku:
+#         return [], "skipped: empty SKU"
+#     if not count_raw:
+#         return [], "skipped: empty count"
+#     try:
+#         n = int(float(count_raw))
+#     except ValueError:
+#         return [], f"skipped: count '{count_raw}' is not a number"
+#     if n <= 0:
+#         return [], "skipped: count is 0"
+
+#     urls = [build_url(base_url, f"{sku}_{i}", ext) for i in range(1, n + 1)]
+
+#     if not verify:
+#         return urls, f"filled (not verified, {n} images)"
+
+#     found = [u for u in urls if http_status(u) == 200]
+#     if len(found) == n:
+#         return found, f"filled ({n}/{n} found)"
+#     if found:
+#         return found, f"PARTIAL ({len(found)}/{n} found)"
+#     return [], f"NOT FOUND in S3 (0/{n} found)"
+
+
+# def process_multi(df, sku_col, count_col, base_url, ext, verify, workers=16, progress_cb=None):
+#     """Returns (url_matrix, report) where url_matrix is a list of lists
+#     (one list of URLs per row, not yet padded to equal length)."""
+#     n = len(df)
+#     skus = df[sku_col].tolist()
+#     counts = df[count_col].tolist()
+#     results = [None] * n
+#     done = 0
+#     with ThreadPoolExecutor(max_workers=workers) as pool:
+#         futures = {
+#             pool.submit(resolve_row_multi, skus[i], counts[i], base_url, ext, verify): i
+#             for i in range(n)
+#         }
+#         for fut in as_completed(futures):
+#             results[futures[fut]] = fut.result()
+#             done += 1
+#             if progress_cb:
+#                 progress_cb(done / n)
+#     url_lists = [r[0] for r in results]
+#     report = pd.DataFrame({
+#         "row": [i + 2 for i in range(n)],
+#         "sku": skus,
+#         "count": counts,
+#         "found": [len(u) for u in url_lists],
+#         "status": [r[1] for r in results],
+#     })
+#     return url_lists, report
+
+def resolve_row_multi(sku, count_raw, main_raw, base_url, ext, verify):
     sku = (sku or "").strip()
     count_raw = (count_raw or "").strip()
 
@@ -640,30 +732,31 @@ def resolve_row_multi(sku, count_raw, base_url, ext, verify):
     if n <= 0:
         return [], "skipped: count is 0"
 
-    urls = [build_url(base_url, f"{sku}_{i}", ext) for i in range(1, n + 1)]
+    main_idx = parse_main_index(main_raw, n)
+    pairs = [(i, build_url(base_url, f"{sku}_{i}", ext)) for i in range(1, n + 1)]
+    main_note = f", main=_{main_idx}" if main_idx else ""
 
     if not verify:
-        return urls, f"filled (not verified, {n} images)"
+        return reorder_main_first(pairs, main_idx), f"filled (not verified, {n} images{main_note})"
 
-    found = [u for u in urls if http_status(u) == 200]
+    found = [(i, u) for i, u in pairs if http_status(u) == 200]
     if len(found) == n:
-        return found, f"filled ({n}/{n} found)"
+        return reorder_main_first(found, main_idx), f"filled ({n}/{n} found{main_note})"
     if found:
-        return found, f"PARTIAL ({len(found)}/{n} found)"
+        return reorder_main_first(found, main_idx), f"PARTIAL ({len(found)}/{n} found{main_note})"
     return [], f"NOT FOUND in S3 (0/{n} found)"
 
 
-def process_multi(df, sku_col, count_col, base_url, ext, verify, workers=16, progress_cb=None):
-    """Returns (url_matrix, report) where url_matrix is a list of lists
-    (one list of URLs per row, not yet padded to equal length)."""
+def process_multi(df, sku_col, count_col, main_col, base_url, ext, verify, workers=16, progress_cb=None):
     n = len(df)
     skus = df[sku_col].tolist()
     counts = df[count_col].tolist()
+    mains = df[main_col].tolist() if main_col and main_col in df.columns else [""] * n
     results = [None] * n
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(resolve_row_multi, skus[i], counts[i], base_url, ext, verify): i
+            pool.submit(resolve_row_multi, skus[i], counts[i], mains[i], base_url, ext, verify): i
             for i in range(n)
         }
         for fut in as_completed(futures):
@@ -676,12 +769,11 @@ def process_multi(df, sku_col, count_col, base_url, ext, verify, workers=16, pro
         "row": [i + 2 for i in range(n)],
         "sku": skus,
         "count": counts,
+        "main": mains,
         "found": [len(u) for u in url_lists],
         "status": [r[1] for r in results],
     })
     return url_lists, report
-
-
 # --------------------------------------------------------------------------- #
 # File I/O
 # --------------------------------------------------------------------------- #
@@ -782,6 +874,190 @@ def write_csv_multi(df: pd.DataFrame, img_col: str, url_lists: list) -> bytes:
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
+# def main():
+#     st.set_page_config(page_title="S3 Image URL Mapper", page_icon="🖼️", layout="wide")
+#     st.title("🖼️ S3 Image URL Mapper")
+#     st.caption("Fill in S3 image URLs for your product sheet, built from the SKU.")
+
+#     with st.sidebar:
+#         st.header("Settings")
+#         mode = st.radio(
+#             "Mode",
+#             ["Single image per product", "Multiple images (count column)"],
+#             help=("Single: one URL built from the SKU, e.g. SKU.jpg.\n\n"
+#                   "Multiple: a column holds how many images a product has "
+#                   "(e.g. subImage = 8); this builds SKU_1.jpg .. SKU_8.jpg, "
+#                   "one per column (images_1, images_2, ...), each a real "
+#                   "clickable link."),
+#         )
+#         base_url = st.text_input("S3 / CloudFront base URL", DEFAULT_BASE_URL,
+#                                  help="Folder URL where the images live. The SKU + extension is appended.")
+
+#         if mode == "Single image per product":
+#             exts = st.multiselect("Image extensions to try (in order)", EXT_CHOICES, default=["jpg"],
+#                                   help="With verification on, each extension is tried until one exists in S3.")
+#             verify = st.checkbox("Verify that each image exists in S3", value=False,
+#                                  help="Sends a HEAD request per URL. Needs the images to be publicly readable. "
+#                                       "Off = build every URL without checking S3.")
+#             overwrite = st.checkbox("Overwrite URLs that already exist", value=False,
+#                                     help="Off = only blank cells are filled.")
+#             check_existing = st.checkbox("Also verify existing URLs", value=False,
+#                                          disabled=overwrite)
+#             workers = st.slider("Parallel requests", 1, 32, 16)
+#             if not exts:
+#                 st.warning("Select at least one image extension in the sidebar.")
+#                 st.stop()
+#         else:
+#             ext = st.selectbox("Image extension", EXT_CHOICES, index=0)
+#             layout = st.radio(
+#                 "Output layout",
+#                 ["One column, comma-separated", "Separate column per image (clickable links)"],
+#                 help=("One column: all URLs joined by commas in a single 'images' cell "
+#                       "(plain text — Excel can't make a comma list individually clickable).\n\n"
+#                       "Separate columns: images_1, images_2, ... each a real clickable link."),
+#             )
+#             separator = ","
+#             if layout == "One column, comma-separated":
+#                 separator = st.text_input("Separator between URLs", ",")
+#             verify = st.checkbox("Verify that each image exists in S3", value=False,
+#                                  help="Sends a HEAD request per generated URL. If some of the N "
+#                                       "images for a product are missing, only the ones found are "
+#                                       "kept (marked PARTIAL in the report). Off = build every URL "
+#                                       "without checking S3.")
+#             workers = st.slider("Parallel requests", 1, 32, 16)
+
+#     uploaded = st.file_uploader("Upload your product file", type=["csv", "xlsx"])
+#     if not uploaded:
+#         st.info("Upload a .csv or .xlsx file to begin.")
+#         return
+
+#     raw = uploaded.getvalue()
+#     is_excel = uploaded.name.lower().endswith(".xlsx")
+#     sheet = None
+
+#     try:
+#         if is_excel:
+#             sheets = load_workbook(io.BytesIO(raw), read_only=True).sheetnames
+#             default_idx = next((i for i, s in enumerate(sheets) if "product" in s.lower()), 0)
+#             sheet = st.selectbox("Sheet", sheets, index=default_idx)
+#             df = read_excel(raw, sheet)
+#         else:
+#             df = read_csv(raw)
+#     except Exception as e:
+#         st.error(f"Could not read the file: {e}")
+#         return
+
+#     df.columns = [str(c).strip() for c in df.columns]
+#     st.write(f"**{len(df)} rows**, {len(df.columns)} columns")
+#     st.dataframe(df.head(10), width='stretch')
+
+#     sku_default = next((i for i, c in enumerate(df.columns) if c.lower() == "sku"), 0)
+
+#     if mode == "Single image per product":
+#         c1, c2 = st.columns(2)
+#         sku_col = c1.selectbox("SKU column (used as the image filename)", df.columns, index=sku_default)
+#         img_default = next((c for c in df.columns if c.lower() in ("images", "image", "image_url")), "images")
+#         img_col = c2.text_input("Images column (created if missing)", img_default)
+#     else:
+#         c1, c2, c3 = st.columns(3)
+#         sku_col = c1.selectbox("SKU column (used as the image filename prefix)", df.columns, index=sku_default)
+
+#         count_match = next((i for i, c in enumerate(df.columns) if c.lower() in ("subimage", "sub_image")), None)
+#         # never silently default to the SKU column itself — if nothing looks
+#         # like a count column, fall back to the first *other* column and
+#         # rely on the validation warning below to flag it
+#         if count_match is None:
+#             count_match = next((i for i in range(len(df.columns)) if i != sku_default), 0)
+#         count_col = c2.selectbox("Count column (how many images per product)", df.columns, index=count_match)
+
+#         img_default = next((c for c in df.columns if c.lower() in ("images", "image", "image_url")), "images")
+#         img_col = c3.text_input("Images column prefix (creates images_1, images_2, ...)", img_default)
+
+#         if count_col == sku_col:
+#             st.warning("Count column is the same as the SKU column — that's almost certainly wrong. "
+#                        "Pick the column that holds a number of images per product (e.g. subImage).")
+#         else:
+#             sample = df[count_col].astype(str).str.strip()
+#             sample = sample[sample != ""]
+#             non_numeric = (~sample.str.match(r"^\d+(\.0+)?$")).sum()
+#             if len(sample) and non_numeric / len(sample) > 0.3:
+#                 st.warning(f"'{count_col}' has {non_numeric} of {len(sample)} values that aren't plain numbers. "
+#                            "Make sure this is really the image-count column, not something like the SKU or name.")
+
+#     dup = df[sku_col].str.strip().replace("", pd.NA).dropna().duplicated().sum()
+#     if dup:
+#         st.warning(f"{dup} duplicate SKU(s) found. Those rows will point to the same image(s).")
+
+#     # invalidate any previous result if the file, mode, or key columns changed,
+#     # so a stale report from a different upload is never shown by mistake
+#     run_key = (uploaded.name, uploaded.size, mode, sku_col, img_col,
+#                count_col if mode != "Single image per product" else None,
+#                layout if mode != "Single image per product" else None)
+#     if st.session_state.get("result", {}).get("key") != run_key:
+#         st.session_state.pop("result", None)
+
+#     # ---- Run
+#     if st.button("Generate image URLs", type="primary"):
+#         bar = st.progress(0.0, text="Working...")
+#         stem, suffix = Path(uploaded.name).stem, ".xlsx" if is_excel else ".csv"
+
+#         if mode == "Single image per product":
+#             values, report = process(
+#                 df, sku_col, img_col.strip(), base_url, exts, verify, overwrite,
+#                 check_existing and not overwrite, workers,
+#                 progress_cb=lambda p: bar.progress(p, text=f"Working... {int(p * 100)}%"),
+#             )
+#             out_bytes = (write_excel_single(raw, sheet, img_col.strip(), values) if is_excel
+#                          else write_csv_single(df, img_col.strip(), values))
+#         else:
+#             url_lists, report = process_multi(
+#                 df, sku_col, count_col, base_url, ext, verify, workers,
+#                 progress_cb=lambda p: bar.progress(p, text=f"Working... {int(p * 100)}%"),
+#             )
+#             if layout == "One column, comma-separated":
+#                 values = [separator.join(u) for u in url_lists]
+#                 out_bytes = (write_excel_single(raw, sheet, img_col.strip(), values) if is_excel
+#                              else write_csv_single(df, img_col.strip(), values))
+#             else:
+#                 out_bytes = (write_excel_multi(raw, sheet, img_col.strip(), url_lists) if is_excel
+#                              else write_csv_multi(df, img_col.strip(), url_lists))
+#         bar.empty()
+
+#         st.session_state["result"] = {
+#             "key": run_key,
+#             "report": report,
+#             "bytes": out_bytes,
+#             "name": f"{stem}_with_images{suffix}",
+#             "mime": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+#                      if is_excel else "text/csv"),
+#         }
+
+#     # ---- Output
+#     res = st.session_state.get("result")
+#     if res:
+#         report = res["report"]
+#         counts = report["status"].str.replace(r"\s*\(.*\)", "", regex=True).value_counts()
+#         st.subheader("Result")
+#         cols = st.columns(max(len(counts), 1))
+#         for col, (label, n) in zip(cols, counts.items()):
+#             col.metric(label, int(n))
+
+#         problems = report[report["status"].str.contains("NOT FOUND|BROKEN|skipped|PARTIAL", regex=True)]
+#         if len(problems):
+#             st.error(f"{len(problems)} row(s) need attention:")
+#             st.dataframe(problems, width='stretch', hide_index=True)
+#         else:
+#             st.success("All rows have working image URL(s).")
+
+#         with st.expander("Full report"):
+#             st.dataframe(report, width='stretch', hide_index=True)
+
+#         d1, d2 = st.columns(2)
+#         d1.download_button("⬇️ Download updated file", res["bytes"], res["name"], res["mime"],
+#                            type="primary", width='stretch')
+#         d2.download_button("⬇️ Download report (CSV)", report.to_csv(index=False).encode("utf-8-sig"),
+#                            "image_mapping_report.csv", "text/csv", width='stretch')
+
 def main():
     st.set_page_config(page_title="S3 Image URL Mapper", page_icon="🖼️", layout="wide")
     st.title("🖼️ S3 Image URL Mapper")
@@ -810,7 +1086,7 @@ def main():
             overwrite = st.checkbox("Overwrite URLs that already exist", value=False,
                                     help="Off = only blank cells are filled.")
             check_existing = st.checkbox("Also verify existing URLs", value=False,
-                                         disabled=overwrite)
+                                          disabled=overwrite)
             workers = st.slider("Parallel requests", 1, 32, 16)
             if not exts:
                 st.warning("Select at least one image extension in the sidebar.")
@@ -866,20 +1142,29 @@ def main():
         sku_col = c1.selectbox("SKU column (used as the image filename)", df.columns, index=sku_default)
         img_default = next((c for c in df.columns if c.lower() in ("images", "image", "image_url")), "images")
         img_col = c2.text_input("Images column (created if missing)", img_default)
+        main_col = None
     else:
         c1, c2, c3 = st.columns(3)
         sku_col = c1.selectbox("SKU column (used as the image filename prefix)", df.columns, index=sku_default)
 
         count_match = next((i for i, c in enumerate(df.columns) if c.lower() in ("subimage", "sub_image")), None)
-        # never silently default to the SKU column itself — if nothing looks
-        # like a count column, fall back to the first *other* column and
-        # rely on the validation warning below to flag it
         if count_match is None:
             count_match = next((i for i in range(len(df.columns)) if i != sku_default), 0)
         count_col = c2.selectbox("Count column (how many images per product)", df.columns, index=count_match)
 
         img_default = next((c for c in df.columns if c.lower() in ("images", "image", "image_url")), "images")
         img_col = c3.text_input("Images column prefix (creates images_1, images_2, ...)", img_default)
+
+        # Main image column selection
+        main_options = ["(none — keep default 1..N order)"] + list(df.columns)
+        main_match = next((i for i, c in enumerate(df.columns) if c.lower() == "mainimage"), None)
+        main_idx_default = main_match + 1 if main_match is not None else 0
+        main_col_choice = st.selectbox(
+            "Main image column (optional)", main_options, index=main_idx_default,
+            help="If set, the image matching this column's value (e.g. mainImage='791664_7') "
+                 "is moved to the front of the list; the rest keep their normal order.",
+        )
+        main_col = None if main_col_choice == main_options[0] else main_col_choice
 
         if count_col == sku_col:
             st.warning("Count column is the same as the SKU column — that's almost certainly wrong. "
@@ -896,11 +1181,11 @@ def main():
     if dup:
         st.warning(f"{dup} duplicate SKU(s) found. Those rows will point to the same image(s).")
 
-    # invalidate any previous result if the file, mode, or key columns changed,
-    # so a stale report from a different upload is never shown by mistake
+    # Invalidate any previous result if parameters change
     run_key = (uploaded.name, uploaded.size, mode, sku_col, img_col,
                count_col if mode != "Single image per product" else None,
-               layout if mode != "Single image per product" else None)
+               layout if mode != "Single image per product" else None,
+               main_col if mode != "Single image per product" else None)
     if st.session_state.get("result", {}).get("key") != run_key:
         st.session_state.pop("result", None)
 
@@ -919,7 +1204,7 @@ def main():
                          else write_csv_single(df, img_col.strip(), values))
         else:
             url_lists, report = process_multi(
-                df, sku_col, count_col, base_url, ext, verify, workers,
+                df, sku_col, count_col, main_col, base_url, ext, verify, workers,
                 progress_cb=lambda p: bar.progress(p, text=f"Working... {int(p * 100)}%"),
             )
             if layout == "One column, comma-separated":
@@ -965,7 +1250,6 @@ def main():
                            type="primary", width='stretch')
         d2.download_button("⬇️ Download report (CSV)", report.to_csv(index=False).encode("utf-8-sig"),
                            "image_mapping_report.csv", "text/csv", width='stretch')
-
-
+        
 if __name__ == "__main__":
     main()
